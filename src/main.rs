@@ -15,10 +15,34 @@ struct State {
     workspaces: HashMap<String, WorkspaceHistory>,
 }
 
+const HISTORY_LIMIT: usize = 6;
+
 #[derive(Default, Deserialize, Serialize)]
+#[serde(from = "StoredWorkspaceHistory")]
 struct WorkspaceHistory {
+    // Most recently used first, including the current tab.
+    tab_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct StoredWorkspaceHistory {
+    tab_ids: Option<Vec<String>>,
     current_tab_id: Option<String>,
     last_tab_id: Option<String>,
+}
+
+impl From<StoredWorkspaceHistory> for WorkspaceHistory {
+    fn from(stored: StoredWorkspaceHistory) -> Self {
+        Self {
+            tab_ids: stored.tab_ids.unwrap_or_else(|| {
+                stored
+                    .current_tab_id
+                    .into_iter()
+                    .chain(stored.last_tab_id)
+                    .collect()
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,29 +189,21 @@ fn prune(state: &mut State, snapshot: &Snapshot) {
         if !workspaces.contains(id.as_str()) {
             return false;
         }
-        if history
-            .last_tab_id
-            .as_ref()
-            .is_some_and(|t| !valid_tab(snapshot, id, t))
-        {
-            history.last_tab_id = None;
-        }
-        if history
-            .current_tab_id
-            .as_ref()
-            .is_some_and(|t| !valid_tab(snapshot, id, t))
-        {
-            history.current_tab_id = None;
-        }
+        let mut seen = HashSet::new();
+        history
+            .tab_ids
+            .retain(|tab| valid_tab(snapshot, id, tab) && seen.insert(tab.clone()));
+        history.tab_ids.truncate(HISTORY_LIMIT);
         true
     });
 }
 
 fn focus(state: &mut State, workspace: &str, tab: Option<String>) {
     let history = state.workspaces.entry(workspace.to_owned()).or_default();
-    if history.current_tab_id != tab {
-        history.last_tab_id = history.current_tab_id.take();
-        history.current_tab_id = tab;
+    if let Some(tab) = tab {
+        history.tab_ids.retain(|id| id != &tab);
+        history.tab_ids.insert(0, tab);
+        history.tab_ids.truncate(HISTORY_LIMIT);
     }
 }
 
@@ -246,7 +262,6 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
         let _lock = lock(directory, "state.lock")?;
         let mut state = load_state(directory)?;
         let live = snapshot(socket)?;
-        prune(&mut state, &live);
         let data = &event["data"];
         if event["event"] == "tab_focused" {
             let workspace = data["workspace_id"]
@@ -258,11 +273,26 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
             // Focus payloads, not the latest active tab from a snapshot, retain
             // intermediate changes. Ordering is guaranteed within tab.focused.
             if live.workspaces.iter().any(|w| w.workspace_id == workspace) {
-                // Even a now-closed tab represents a real transition. Dropping
-                // it would incorrectly retain older history on returning to B
-                // after queued B -> C -> B events when C has already closed.
+                // Historical focus still counts toward recency and capacity.
+                // Do not prune from an ahead-of-stream snapshot before queued
+                // visits have had a chance to evict the oldest entry.
                 focus(&mut state, workspace, Some(tab.to_owned()));
             }
+        }
+        match (
+            event["event"].as_str(),
+            data["workspace_id"].as_str(),
+            data["tab_id"].as_str(),
+        ) {
+            (Some("tab_closed"), Some(workspace), Some(tab)) => {
+                if let Some(history) = state.workspaces.get_mut(workspace) {
+                    history.tab_ids.retain(|id| id != tab);
+                }
+            }
+            (Some("workspace_closed"), Some(workspace), _) => {
+                state.workspaces.remove(workspace);
+            }
+            _ => (),
         }
         let mut completion = None;
         if let Some((workspace, token)) = control(&event) {
@@ -279,6 +309,9 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
                         eprintln!("herdr-workspace-last-tab: could not prepare action: {error}");
                     }
                 } else if let Some(id) = token.strip_prefix("p:") {
+                    // The barrier has drained preceding focus events. It is now
+                    // safe to reconcile closures using the authoritative read.
+                    prune(&mut state, &live);
                     let phase = match switch_workspace(socket, &mut state, &live, workspace) {
                         Ok(()) => "d",
                         Err(error) => {
@@ -290,7 +323,6 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
                 }
             }
         }
-        prune(&mut state, &live);
         save_state(directory, &state)?;
         if let Some((workspace, token)) = completion {
             if let Err(error) = report_control(socket, &workspace, &token) {
@@ -311,10 +343,12 @@ fn switch_workspace(
         .iter()
         .find(|w| w.workspace_id == workspace)
         .and_then(|w| w.active_tab_id.as_deref());
-    let target = state
-        .workspaces
-        .get(workspace)
-        .and_then(|h| h.last_tab_id.clone());
+    let target = state.workspaces.get(workspace).and_then(|h| {
+        h.tab_ids
+            .iter()
+            .find(|tab| Some(tab.as_str()) != active)
+            .cloned()
+    });
     if let Some(tab) =
         target.filter(|t| Some(t.as_str()) != active && valid_tab(live, workspace, t))
     {

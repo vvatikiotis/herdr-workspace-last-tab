@@ -1,6 +1,6 @@
 # Workspace Last Tab
 
-A Herdr plugin that remembers the previous used tab independently in each workspace and session. Repeated invocations toggle between the current and last tab. Closing a workspace removes its history; closing the last tab clears the reference instead of selecting an older tab.
+A Herdr plugin that remembers up to six distinct recently used tabs per workspace and session, including the current tab. Repeated invocations still toggle only the newest two surviving tabs. Closing a tab removes it from history so older retained tabs become available; Herdr chooses the replacement when the active tab closes. Closing a workspace removes its entire history.
 
 ## Install locally
 
@@ -45,15 +45,23 @@ Requests use the private workspace token `workspace_last_tab_control` with a fiv
 
 History lives under `HERDR_PLUGIN_STATE_DIR/sessions/<hex-encoded-socket-path>/state.json`. Socket identity separates sessions even when their workspace/tab IDs overlap and remains stable across server restarts. The listener prunes invalid references and reconciles restored active tabs on startup. Existing history is preserved; old standalone watcher history is not migrated.
 
+Version 0.3.0 reads the previous plugin's `current_tab_id`/`last_tab_id` pair and saves a most-recent-first `tab_ids` list in the same file. It preserves valid existing entries and learns additional tabs as they are used, rather than filling the list with unvisited open tabs. A seventh distinct tab permanently evicts the oldest entry; closing newer entries does not restore it. Revisits move a tab to the front without consuming another slot.
+
+After rebuilding, restart the Herdr server when convenient to replace its running listener. Rebuilding or reloading configuration alone does not replace the old two-tab listener.
+
 The listener is the sole history writer. State updates use an OS file lock and atomic replacement through a sibling `state.json.new` file in the state directory, never `/tmp`. Invalid state JSON causes an explicit failure rather than silently resetting history.
 
-Tab-focus payloads preserve intermediate tab changes even when a snapshot already shows a later active tab. Herdr guarantees ordering within the tab-focus subscription, not across different subscription types; authoritative snapshots remove closed tabs and workspaces. Pane changes that repeat the same active tab do not change history.
+Tab-focus payloads preserve intermediate tab changes even when a snapshot already shows a later active tab. Closure events remove their entries directly; snapshot pruning runs on startup and at the prepared-action barrier, after preceding focus events have drained. This prevents an ahead-of-stream closure snapshot from erasing visits before the six-entry limit is enforced. Pane changes that repeat the same active tab do not change history.
+
+Herdr 0.9.5 guarantees ordering within the tab-focus subscription, not across different event types. If closures and visits overlap inside a delivery batch, the plugin must use their delivery order. A closure delivered after a later focus can therefore cause an older entry to be evicted early. Exact cross-type chronology requires ordering information from Herdr that the current API does not expose.
 
 Event subscriptions do not replay events from before connection. Startup reconciliation restores current state, not unknowable changes made while the listener was absent. A server-reported `events_lost` or socket error fails the listener explicitly; no accurate history can be reconstructed for dropped events. EOF ends it normally. As with other unsupervised startup commands, a failed listener requires restarting it/server after investigating the plugin logs.
 
 ## Tests
 
 ```sh
+mkdir -p tmp
+export TMPDIR="$PWD/tmp"
 cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
@@ -61,6 +69,6 @@ cargo build --release --locked
 python3 tests/live.py
 ```
 
-`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery, shell invocation, and optional plugin-action dispatch, verifies restart persistence, and stops only its own server. It does not simulate physical keyboard input or modify the active session's registry.
+`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery, shell invocation, and optional plugin-action dispatch, verifies restart persistence, six-tab retention, closure fallback, and eviction, and stops only its own server. Temporary test environments are created under this repository's `tmp/` directory. It does not simulate physical keyboard input or modify the active session's registry.
 
 See [SPEC.md](SPEC.md) for agreed behavior and [GLOSSARY.md](GLOSSARY.md) for terminology.

@@ -14,11 +14,13 @@ PLUGIN = 'user.herdr-workspace-last-tab'
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='last-tab-live-', dir='/tmp') as temporary:
+    scratch = ROOT / 'tmp'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='h-', dir=scratch) as temporary:
         root = Path(temporary)
         env = {k: v for k, v in os.environ.items() if not k.startswith('HERDR_')}
-        env.update(XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
-        config = root / 'config/herdr'
+        env.update(XDG_CONFIG_HOME=str(root), XDG_STATE_HOME=str(root / 'state'), TMPDIR=str(scratch))
+        config = root / 'herdr'
         config.mkdir(parents=True)
         shell_command = [str(ROOT / 'target/release/herdr-workspace-last-tab'), 'switch']
         config.joinpath('config.toml').write_text(f'''onboarding = false
@@ -30,10 +32,10 @@ type = "shell"
 command = {json.dumps(shlex.join(shell_command))}
 ''')
         env['HERDR_CONFIG_PATH'] = str(config / 'config.toml')
-        socket_path = config / 'sessions/last-tab-test/herdr.sock'
+        socket_path = config / 'herdr.sock'
 
         def cli(*args):
-            result = subprocess.run(['herdr', '--session', 'last-tab-test', *args], env=env,
+            result = subprocess.run(['herdr', *args], env=env,
                                     capture_output=True, text=True, timeout=10)
             assert result.returncode == 0, result.stderr + result.stdout
             return result.stdout
@@ -60,7 +62,7 @@ command = {json.dumps(shlex.join(shell_command))}
 
         cli('plugin', 'link', str(ROOT))
         with open(root / 'server.log', 'w+') as log:
-            server = subprocess.Popen(['herdr', '--session', 'last-tab-test', 'server'],
+            server = subprocess.Popen(['herdr', 'server'],
                                       env=env, stdout=log, stderr=log)
             try:
                 eventually(lambda: socket_path.exists() or server.poll() is not None, 'server did not start')
@@ -111,7 +113,7 @@ command = {json.dumps(shlex.join(shell_command))}
                         return True
                 eventually(old_listener_exited, 'old listener did not exit')
                 before_restart = state_file.stat().st_mtime_ns
-                server = subprocess.Popen(['herdr', '--session', 'last-tab-test', 'server'],
+                server = subprocess.Popen(['herdr', 'server'],
                                           env=env, stdout=log, stderr=log)
                 eventually(lambda: state_file.stat().st_mtime_ns != before_restart,
                            'restart listener did not reconcile persisted history')
@@ -121,8 +123,26 @@ command = {json.dumps(shlex.join(shell_command))}
                 assert PLUGIN in json.dumps(registered), registered
                 request('plugin.action.invoke', action_id=PLUGIN + '.switch')
                 eventually(lambda: active() == b, 'optional plugin action stopped working')
-                print('PASS: real startup hook, shell invocation, rapid focus events, toggle, restart, and plugin action')
+                extra = [request('tab.create', workspace_id=workspace_id, label=label, focus=True)['tab']['tab_id']
+                         for label in ['D', 'E', 'F', 'G']]
+                g = extra[-1]
+                # Recency is now G,F,E,D,B,C; A is still open but evicted.
+                for tab in [b, *extra[:-1]]:
+                    request('tab.close', tab_id=tab)
+                switch()
+                eventually(lambda: active() == c, 'sixth retained tab was forgotten')
+                switch()
+                eventually(lambda: active() == g, 'newest-two toggle changed')
+                request('tab.close', tab_id=c)
+                switch()
+                assert active() == g, f'closing newer tabs resurrected an evicted tab: expected {g}, got {active()}'
+                request('tab.focus', tab_id=a)
+                switch()
+                eventually(lambda: active() == g, 'revisited evicted tab did not re-enter history')
+                print('PASS: startup, shell/action invocation, ordering, restart, six-tab retention, closure fallback, and eviction')
             except Exception:
+                for saved in (root / 'state').glob('herdr/plugins/*/sessions/*/state.json'):
+                    print('test history:', saved.read_text())
                 try:
                     print('plugin logs:', json.dumps(request('plugin.log.list', plugin_id=PLUGIN, limit=20), indent=2))
                 except OSError:

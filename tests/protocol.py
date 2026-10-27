@@ -9,6 +9,9 @@ import threading
 import time
 import unittest
 
+SCRATCH = Path(__file__).resolve().parents[1] / 'tmp'
+SCRATCH.mkdir(exist_ok=True)
+
 BINARY = os.environ.get('LAST_TAB_BINARY', str(Path(__file__).resolve().parents[1] / 'target/debug/herdr-workspace-last-tab'))
 
 
@@ -158,7 +161,7 @@ class Herdr:
 
 class Protocol(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.TemporaryDirectory(prefix='last-tab-', dir='/tmp')
+        self.root = tempfile.TemporaryDirectory(prefix='last-tab-', dir=SCRATCH)
         self.server = Herdr(self.root.name)
         self.env = dict(os.environ, HERDR_SOCKET_PATH=self.server.path,
                         HERDR_PLUGIN_STATE_DIR=self.root.name + '/state')
@@ -271,25 +274,121 @@ class Protocol(unittest.TestCase):
         self.switch()
         self.assertEqual(self.server.requests, ['a'])
 
-    def test_closing_last_tab_does_not_fall_back(self):
+    def test_existing_two_tab_history_is_preserved_when_restored_active_changes(self):
+        directory = Path(self.env['HERDR_PLUGIN_STATE_DIR']) / 'sessions' / os.fsencode(self.server.path).hex()
+        directory.mkdir(parents=True)
+        directory.joinpath('state.json').write_text(json.dumps({'workspaces': {
+            'w': {'current_tab_id': 'b', 'last_tab_id': 'a'}}}))
+        self.server.active['w'] = 'c'
+        self.listen()
+        self.server.tabs['w'].remove('b')
+        self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id='b')
+        self.switch()
+        self.assertEqual(self.server.requests, ['a'])
+
+    def test_queued_focuses_count_for_eviction_before_later_closures(self):
+        self.server.tabs['w'] = list('abcdefg')
+        self.listen()
+        for tab in 'cb':
+            self.server.focus('w', tab)
+        self.server.active['w'] = 'g'
+        for tab in 'bdef':
+            self.server.tabs['w'].remove(tab)
+        # These visits occurred before the closures; snapshots are already ahead.
+        for tab in 'defg':
+            self.server.event('tab.focused', type='tab_focused', workspace_id='w', tab_id=tab)
+        self.switch()
+        self.assertEqual(self.server.requests, ['c'])
+        self.switch()
+        self.assertEqual(self.server.requests, ['c', 'g'])
+        self.server.tabs['w'].remove('c')
+        self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id='c')
+        self.switch()
+        self.assertEqual(self.server.requests, ['c', 'g'])
+
+    def test_six_total_tabs_evict_oldest_without_resurrecting_it(self):
+        self.server.tabs['w'] = list('abcdefg')
+        self.listen()
+        for tab in 'bcdefg':
+            self.server.focus('w', tab)
+        for tab in 'cdef':
+            self.server.tabs['w'].remove(tab)
+            self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id=tab)
+        self.assertEqual(self.server.requests, [])  # Closures never choose a tab.
+        self.switch()
+        self.assertEqual(self.server.requests, ['b'])  # The sixth retained entry.
+        self.server.tabs['w'].remove('b')
+        self.server.active['w'] = 'g'  # Herdr chooses the replacement.
+        self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id='b')
+        self.server.focus('w', 'g')
+        self.switch()
+        self.assertEqual(self.server.requests, ['b'])  # A is open but was evicted.
+        self.server.focus('w', 'a')
+        self.switch()
+        self.assertEqual(self.server.requests, ['b', 'g'])  # A re-enters only on use.
+
+    def test_revisits_are_distinct_and_shortcut_only_toggles_newest_two(self):
+        self.server.tabs['w'] = list('abcdef')
+        self.listen()
+        for tab in 'bcdef' + 'a' * 10:
+            self.server.focus('w', tab)
+        self.switch()
+        self.switch()
+        self.assertEqual(self.server.requests, ['f', 'a'])
+        for tab in 'cdef':
+            self.server.tabs['w'].remove(tab)
+            self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id=tab)
+        self.switch()
+        self.assertEqual(self.server.requests, ['f', 'a', 'b'])
+
+    def test_all_six_entries_survive_listener_restart(self):
+        self.server.tabs['w'] = list('abcdef')
+        listener = self.listen()
+        for tab in 'bcdef':
+            self.server.focus('w', tab)
+        self.server.subscriber.shutdown(socket.SHUT_RDWR)
+        self.assertEqual(listener.wait(timeout=3), 0)
+        self.server.subscriber = None
+        self.listen()
+        for tab in 'bcde':
+            self.server.tabs['w'].remove(tab)
+            self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id=tab)
+        self.switch()
+        self.assertEqual(self.server.requests, ['a'])
+
+    def test_legacy_invalid_references_do_not_seed_unvisited_open_tabs(self):
+        directory = Path(self.env['HERDR_PLUGIN_STATE_DIR']) / 'sessions' / os.fsencode(self.server.path).hex()
+        directory.mkdir(parents=True)
+        directory.joinpath('state.json').write_text(json.dumps({'workspaces': {
+            'w': {'current_tab_id': 'a', 'last_tab_id': 'missing'},
+            'closed': {'current_tab_id': 'b', 'last_tab_id': None}}}))
+        self.listen()
+        self.switch()
+        self.assertEqual(self.server.requests, [])
+        self.server.focus('w', 'b')
+        self.switch()
+        self.assertEqual(self.server.requests, ['a'])
+
+    def test_closing_last_tab_falls_back_to_older_history(self):
         self.listen()
         self.server.focus('w', 'b')
         self.server.focus('w', 'c')
         self.server.tabs['w'].remove('b')
         self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id='b')
         self.switch()
-        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.server.requests, ['a'])
 
-    def test_closing_current_tab_does_not_restore_older_history(self):
+    def test_closing_current_tab_keeps_history_and_herdr_replacement(self):
         self.listen()
         self.server.focus('w', 'b')
         self.server.focus('w', 'c')
         self.server.tabs['w'].remove('c')
-        self.server.active['w'] = 'b'
+        self.server.active['w'] = 'a'  # Herdr may choose a tab other than B.
         self.server.event('tab.closed', type='tab_closed', workspace_id='w', tab_id='c')
-        self.server.focus('w', 'b')
-        self.switch()
+        self.server.focus('w', 'a')
         self.assertEqual(self.server.requests, [])
+        self.switch()
+        self.assertEqual(self.server.requests, ['b'])
 
     def test_closed_workspace_history_is_deleted(self):
         self.listen()
@@ -383,14 +482,14 @@ class Protocol(unittest.TestCase):
         self.switch()
         self.assertEqual(self.server.requests, ['b'])
 
-    def test_queued_focus_of_closed_current_tab_clears_older_history(self):
+    def test_queued_focus_of_closed_current_tab_preserves_older_history(self):
         self.listen()
         self.server.active['w'] = 'b'
         self.server.tabs['w'].remove('c')
         for tab in ['b', 'c', 'b']:
             self.server.event('tab.focused', type='tab_focused', workspace_id='w', tab_id=tab)
         self.switch()
-        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.server.requests, ['a'])
 
     def test_delayed_action_focus_event_does_not_break_next_toggle(self):
         self.listen()
