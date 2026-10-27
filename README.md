@@ -13,13 +13,13 @@ herdr plugin link "$PWD"
 
 Local linking does not run build commands. The manifest's build command is for GitHub installs.
 
-Bind the action in Herdr's `config.toml`:
+Bind the binary and subcommand in Herdr's `config.toml` (replace the absolute path with your linked plugin directory):
 
 ```toml
 [[keys.command]]
 key = "prefix+a"
-type = "plugin_action"
-command = "user.herdr-workspace-last-tab.switch"
+type = "shell"
+command = "/absolute/path/to/herdr-workspace-last-tab/target/release/herdr-workspace-last-tab switch"
 description = "jump to last tab in this workspace"
 ```
 
@@ -35,7 +35,9 @@ Herdr runs `listen` as the plugin startup command. It subscribes to tab-focus, w
 herdr plugin log list --plugin user.herdr-workspace-last-tab
 ```
 
-`switch` is a short-lived plugin action that requests a switch from the listener and waits for completion (up to five seconds). It does not independently advance history from a potentially ahead-of-stream snapshot. Both commands require Herdr's injected `HERDR_SOCKET_PATH` and `HERDR_PLUGIN_STATE_DIR`.
+`switch` is a short-lived command that requests a switch from the listener and waits for completion (up to five seconds). It does not independently advance history from a potentially ahead-of-stream snapshot. Both commands require Herdr's injected `HERDR_SOCKET_PATH`. The registered plugin action remains supported, but is not required for the shell binding.
+
+`HERDR_PLUGIN_STATE_DIR` takes precedence when provided. Ordinary shell commands do not receive it, so they resolve the same plugin state directory as Herdr: `$XDG_STATE_HOME/herdr/plugins/user.herdr-workspace-last-tab`, or `$HOME/.local/state/herdr/plugins/user.herdr-workspace-last-tab` if `XDG_STATE_HOME` is unset. Shell commands and startup hooks therefore share history and session locks.
 
 A session-specific action lock serializes complete shortcut invocations, including their completion acknowledgment. It is separate from the listener's state lock, so the listener can continue processing events while an action waits.
 
@@ -59,6 +61,6 @@ cargo build --release --locked
 python3 tests/live.py
 ```
 
-`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery and plugin-action dispatch, verifies restart persistence, and stops only its own server. It does not simulate physical keyboard input or modify the active session's registry.
+`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery, shell invocation, and optional plugin-action dispatch, verifies restart persistence, and stops only its own server. It does not simulate physical keyboard input or modify the active session's registry.
 
 See [SPEC.md](SPEC.md) for agreed behavior and [GLOSSARY.md](GLOSSARY.md) for terminology.

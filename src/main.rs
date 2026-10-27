@@ -44,9 +44,28 @@ fn required_path(name: &str) -> io::Result<PathBuf> {
     env::var_os(name).map(PathBuf::from).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{name} is required; invoke through Herdr's plugin interface"),
+            format!("{name} is required; run from Herdr so its session context is available"),
         )
     })
+}
+
+fn plugin_state_directory() -> io::Result<PathBuf> {
+    if let Some(directory) = env::var_os("HERDR_PLUGIN_STATE_DIR") {
+        return Ok(PathBuf::from(directory));
+    }
+    // Shell keybindings receive session context, but not plugin-specific paths.
+    // Match Herdr's state directory for this plugin rather than inventing a
+    // separate shell-mode history or lock namespace.
+    let state_root = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HERDR_PLUGIN_STATE_DIR, XDG_STATE_HOME, or HOME is required",
+            )
+        })?;
+    Ok(state_root.join("herdr/plugins/user.herdr-workspace-last-tab"))
 }
 
 fn session_directory(socket: &Path) -> io::Result<PathBuf> {
@@ -58,9 +77,7 @@ fn session_directory(socket: &Path) -> io::Result<PathBuf> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let directory = required_path("HERDR_PLUGIN_STATE_DIR")?
-        .join("sessions")
-        .join(key);
+    let directory = plugin_state_directory()?.join("sessions").join(key);
     fs::create_dir_all(&directory)?;
     Ok(directory)
 }

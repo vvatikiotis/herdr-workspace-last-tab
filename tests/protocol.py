@@ -194,6 +194,34 @@ class Protocol(unittest.TestCase):
                                 capture_output=True, text=True, timeout=3)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_shell_invocations_share_explicit_plugin_state_via_xdg(self):
+        self.env['XDG_STATE_HOME'] = self.root.name + '/xdg'
+        self.env['HERDR_PLUGIN_STATE_DIR'] = self.env['XDG_STATE_HOME'] + '/herdr/plugins/user.herdr-workspace-last-tab'
+        self.listen()
+        shell_env = dict(self.env)
+        del shell_env['HERDR_PLUGIN_STATE_DIR']
+        # The same session lock must reject a duplicate listener in shell mode.
+        duplicate = subprocess.run([BINARY, 'listen'], env=shell_env, capture_output=True, timeout=3)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.server.focus('w', 'b')
+        result = subprocess.run([BINARY, 'switch'], env=shell_env, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.requests, ['a'])
+
+    def test_shell_invocations_share_explicit_plugin_state_via_home(self):
+        self.env['HOME'] = self.root.name + '/home'
+        self.env.pop('XDG_STATE_HOME', None)
+        self.env['HERDR_PLUGIN_STATE_DIR'] = self.env['HOME'] + '/.local/state/herdr/plugins/user.herdr-workspace-last-tab'
+        self.listen()
+        shell_env = dict(self.env)
+        del shell_env['HERDR_PLUGIN_STATE_DIR']
+        duplicate = subprocess.run([BINARY, 'listen'], env=shell_env, capture_output=True, timeout=3)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.server.focus('w', 'b')
+        result = subprocess.run([BINARY, 'switch'], env=shell_env, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.requests, ['a'])
+
     def test_tracks_previous_tab_and_toggles(self):
         self.listen()
         self.switch()

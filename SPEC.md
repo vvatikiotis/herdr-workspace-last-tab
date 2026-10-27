@@ -15,6 +15,7 @@ Agreed behavior for the event-driven plugin redesign. This describes requirement
 
 ## Switching and closure
 
+- The shortcut invokes the binary path with the `switch` subcommand as a Herdr shell command; a qualified plugin-action ID is not required.
 - The shortcut targets only the focused workspace's distinct, existing last tab.
 - Without a valid last tab, the shortcut does nothing.
 - Successful switches update history so repeated presses toggle between the two tabs.
@@ -29,7 +30,7 @@ Agreed behavior for the event-driven plugin redesign. This describes requirement
 
 ## Implementation constraints
 
-- Store plugin-owned history under `HERDR_PLUGIN_STATE_DIR`.
+- Store plugin-owned history under `HERDR_PLUGIN_STATE_DIR` when provided. Shell invocations without that variable resolve the same directory using `$XDG_STATE_HOME/herdr/plugins/user.herdr-workspace-last-tab`, or `$HOME/.local/state/herdr/plugins/user.herdr-workspace-last-tab` when `XDG_STATE_HOME` is unset. Do not create separate history or lock namespaces for shell invocations.
 - Keep histories isolated by Herdr session; do not assume the directory itself is session-specific.
 
 ## Verified implementation choices

@@ -1,8 +1,10 @@
 """Opt-in real Herdr test. Uses private config/state and a disposable server."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import socket
+import shlex
 import subprocess
 import tempfile
 import time
@@ -18,13 +20,14 @@ def main():
         env.update(XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
         config = root / 'config/herdr'
         config.mkdir(parents=True)
-        config.joinpath('config.toml').write_text('''onboarding = false
+        shell_command = [str(ROOT / 'target/release/herdr-workspace-last-tab'), 'switch']
+        config.joinpath('config.toml').write_text(f'''onboarding = false
 [terminal]
 default_shell = "/bin/sh"
 [[keys.command]]
 key = "prefix+a"
-type = "plugin_action"
-command = "user.herdr-workspace-last-tab.switch"
+type = "shell"
+command = {json.dumps(shlex.join(shell_command))}
 ''')
         env['HERDR_CONFIG_PATH'] = str(config / 'config.toml')
         socket_path = config / 'sessions/last-tab-test/herdr.sock'
@@ -47,8 +50,11 @@ command = "user.herdr-workspace-last-tab.switch"
         def eventually(predicate, description):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if predicate():
-                    return
+                try:
+                    if predicate():
+                        return
+                except OSError:
+                    pass  # A restarting test server may not have bound its socket yet.
                 time.sleep(.03)
             raise AssertionError(description)
 
@@ -72,7 +78,10 @@ command = "user.herdr-workspace-last-tab.switch"
                     snapshot = request('session.snapshot')['snapshot']
                     return next(w['active_tab_id'] for w in snapshot['workspaces'] if w['workspace_id'] == workspace_id)
                 def switch():
-                    request('plugin.action.invoke', action_id=PLUGIN + '.switch')
+                    # Shell keybindings have session context, not plugin paths.
+                    shell_env = dict(env, HERDR_ENV='1', HERDR_SOCKET_PATH=str(socket_path))
+                    result = subprocess.run(shell_command, env=shell_env, capture_output=True, text=True, timeout=7)
+                    assert result.returncode == 0, result.stderr
                 # No delivery sleeps: the action/listener barrier must catch up.
                 switch()
                 eventually(lambda: active() == b, 'C did not switch to B')
@@ -88,9 +97,20 @@ command = "user.herdr-workspace-last-tab.switch"
                     switch()
                     eventually(lambda: active() == expected, 'repeated toggle lost event ordering')
                 state_file = next((root / 'state').glob('herdr/plugins/*/sessions/*/state.json'))
-                before_restart = state_file.stat().st_mtime_ns
                 request('server.stop')
                 server.wait(timeout=10)
+                # Startup commands can outlive their server briefly. Wait for
+                # the old singleton lease before launching its replacement.
+                def old_listener_exited():
+                    with open(state_file.parent / 'listener.lock', 'rb') as lease:
+                        try:
+                            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return False
+                        fcntl.flock(lease, fcntl.LOCK_UN)
+                        return True
+                eventually(old_listener_exited, 'old listener did not exit')
+                before_restart = state_file.stat().st_mtime_ns
                 server = subprocess.Popen(['herdr', '--session', 'last-tab-test', 'server'],
                                           env=env, stdout=log, stderr=log)
                 eventually(lambda: state_file.stat().st_mtime_ns != before_restart,
@@ -99,17 +119,29 @@ command = "user.herdr-workspace-last-tab.switch"
                 eventually(lambda: active() == c, 'history did not survive server restart')
                 registered = request('plugin.action.list', plugin_id=PLUGIN)
                 assert PLUGIN in json.dumps(registered), registered
-                print('PASS: real startup hook, rapid focus events, action dispatch, toggle, and restart')
+                request('plugin.action.invoke', action_id=PLUGIN + '.switch')
+                eventually(lambda: active() == b, 'optional plugin action stopped working')
+                print('PASS: real startup hook, shell invocation, rapid focus events, toggle, restart, and plugin action')
             except Exception:
-                print('plugin logs:', json.dumps(request('plugin.log.list', plugin_id=PLUGIN, limit=20), indent=2))
+                try:
+                    print('plugin logs:', json.dumps(request('plugin.log.list', plugin_id=PLUGIN, limit=20), indent=2))
+                except OSError:
+                    print('test server unavailable; plugin logs could not be retrieved')
                 log.flush()
                 log.seek(0)
                 print('server log tail:', log.read()[-6000:])
                 raise
             finally:
-                if socket_path.exists() and server.poll() is None:
-                    request('server.stop')
-                server.wait(timeout=10)
+                if server.poll() is None:
+                    try:
+                        request('server.stop')
+                    except OSError:
+                        server.terminate()  # This process owns only the disposable server.
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
 
 
 if __name__ == '__main__':
