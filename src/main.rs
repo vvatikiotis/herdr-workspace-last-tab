@@ -6,7 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::{ffi::OsStrExt, net::UnixStream},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Default, Deserialize, Serialize)]
@@ -65,13 +65,13 @@ fn session_directory(socket: &Path) -> io::Result<PathBuf> {
     Ok(directory)
 }
 
-fn lock(directory: &Path) -> io::Result<fs::File> {
+fn lock(directory: &Path, name: &str) -> io::Result<fs::File> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(directory.join("state.lock"))?;
+        .open(directory.join(name))?;
     file.lock()?;
     Ok(file)
 }
@@ -202,7 +202,8 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
         &mut stream,
         "events.subscribe",
         json!({"subscriptions": [
-            {"type": "tab.focused"}, {"type": "tab.closed"}, {"type": "workspace.closed"}
+            {"type": "tab.focused"}, {"type": "workspace.metadata_updated"},
+            {"type": "tab.closed"}, {"type": "workspace.closed"}
         ]}),
     )?;
     let mut reader = BufReader::new(stream);
@@ -213,18 +214,19 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
         ));
     }
     {
-        let _lock = lock(directory)?;
+        let _lock = lock(directory, "state.lock")?;
         let mut state = load_state(directory)?;
         reconcile(&mut state, &snapshot(socket)?);
         save_state(directory, &state)?;
     }
+    let mut seen_controls = HashSet::new();
     loop {
         let event = match read_json(&mut reader) {
             Ok(event) => event,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
         };
-        let _lock = lock(directory)?;
+        let _lock = lock(directory, "state.lock")?;
         let mut state = load_state(directory)?;
         let live = snapshot(socket)?;
         prune(&mut state, &live);
@@ -238,37 +240,161 @@ fn listen(socket: &Path, directory: &Path) -> io::Result<()> {
                 .ok_or_else(|| io::Error::other("missing tab_id"))?;
             // Focus payloads, not the latest active tab from a snapshot, retain
             // intermediate changes. Ordering is guaranteed within tab.focused.
-            if live.workspaces.iter().any(|w| w.workspace_id == workspace)
-                && valid_tab(&live, workspace, tab)
-            {
+            if live.workspaces.iter().any(|w| w.workspace_id == workspace) {
+                // Even a now-closed tab represents a real transition. Dropping
+                // it would incorrectly retain older history on returning to B
+                // after queued B -> C -> B events when C has already closed.
                 focus(&mut state, workspace, Some(tab.to_owned()));
             }
         }
+        let mut completion = None;
+        if let Some((workspace, token)) = control(&event) {
+            seen_controls.retain(|token: &String| fresh_control(token));
+            if live.workspaces.iter().any(|w| w.workspace_id == workspace)
+                && fresh_control(token)
+                && seen_controls.insert(token.to_owned())
+            {
+                if let Some(id) = token.strip_prefix("r:") {
+                    // Herdr 0.9.5 drains focus batches before metadata batches.
+                    // A reply emitted here cannot be in the metadata batch
+                    // already being delivered: another focus drain precedes it.
+                    if let Err(error) = report_control(socket, workspace, &format!("p:{id}")) {
+                        eprintln!("herdr-workspace-last-tab: could not prepare action: {error}");
+                    }
+                } else if let Some(id) = token.strip_prefix("p:") {
+                    let phase = match switch_workspace(socket, &mut state, &live, workspace) {
+                        Ok(()) => "d",
+                        Err(error) => {
+                            eprintln!("herdr-workspace-last-tab: action failed: {error}");
+                            "e"
+                        }
+                    };
+                    completion = Some((workspace.to_owned(), format!("{phase}:{id}")));
+                }
+            }
+        }
+        prune(&mut state, &live);
         save_state(directory, &state)?;
+        if let Some((workspace, token)) = completion {
+            if let Err(error) = report_control(socket, &workspace, &token) {
+                eprintln!("herdr-workspace-last-tab: could not acknowledge action: {error}");
+            }
+        }
     }
 }
 
-fn switch(socket: &Path, directory: &Path) -> io::Result<()> {
-    let _lock = lock(directory)?;
-    let live = snapshot(socket)?;
-    let mut state = load_state(directory)?;
-    prune(&mut state, &live);
-    let target = live.focused_workspace_id.as_ref().and_then(|workspace| {
-        let active = live
-            .workspaces
-            .iter()
-            .find(|w| &w.workspace_id == workspace)?
-            .active_tab_id
-            .as_ref();
-        let history = state.workspaces.get(workspace)?;
-        let tab = history.last_tab_id.as_ref()?;
-        (Some(tab) != active).then(|| (workspace.clone(), tab.clone()))
-    });
-    if let Some((workspace, tab)) = target {
+fn switch_workspace(
+    socket: &Path,
+    state: &mut State,
+    live: &Snapshot,
+    workspace: &str,
+) -> io::Result<()> {
+    let active = live
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id == workspace)
+        .and_then(|w| w.active_tab_id.as_deref());
+    let target = state
+        .workspaces
+        .get(workspace)
+        .and_then(|h| h.last_tab_id.clone());
+    if let Some(tab) =
+        target.filter(|t| Some(t.as_str()) != active && valid_tab(live, workspace, t))
+    {
         request(socket, "tab.focus", json!({"tab_id": tab}))?;
-        focus(&mut state, &workspace, Some(tab));
+        focus(state, workspace, Some(tab));
     }
-    save_state(directory, &state)
+    Ok(())
+}
+
+const CONTROL_KEY: &str = "workspace_last_tab_control";
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn control(event: &Value) -> Option<(&str, &str)> {
+    if event["event"] != "workspace_metadata_updated" {
+        return None;
+    }
+    let workspace = &event["data"]["workspace"];
+    Some((
+        workspace["workspace_id"].as_str()?,
+        workspace["tokens"][CONTROL_KEY].as_str()?,
+    ))
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn fresh_control(token: &str) -> bool {
+    token
+        .split(':')
+        .nth(1)
+        .and_then(|n| n.parse::<u128>().ok())
+        .is_some_and(|time| {
+            let now = now_nanos();
+            time <= now && now - time < CONTROL_TIMEOUT.as_nanos()
+        })
+}
+
+fn report_control(socket: &Path, workspace: &str, token: &str) -> io::Result<()> {
+    request(
+        socket,
+        "workspace.report_metadata",
+        json!({
+            "workspace_id": workspace, "source": "user.herdr-workspace-last-tab",
+            "tokens": {CONTROL_KEY: token}, "ttl_ms": 5000
+        }),
+    )?;
+    Ok(())
+}
+
+fn switch(socket: &Path, directory: &Path) -> io::Result<()> {
+    // Serialize whole actions, not just writes: the preceding action's focus
+    // event must drain through the next request's barrier before another toggle.
+    let _action_lock = lock(directory, "action.lock")?;
+    let Some(workspace) = snapshot(socket)?.focused_workspace_id else {
+        return Ok(());
+    };
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
+    send_request(
+        &mut stream,
+        "events.subscribe",
+        json!({"subscriptions": [{"type": "workspace.metadata_updated"}]}),
+    )?;
+    let mut reader = BufReader::new(stream);
+    let acknowledgment = read_json(&mut reader)?;
+    if acknowledgment["result"]["type"] != "subscription_started" {
+        return Err(io::Error::other(
+            "Herdr did not acknowledge the action subscription",
+        ));
+    }
+    let id = format!("{}:{}", now_nanos(), std::process::id());
+    report_control(socket, &workspace, &format!("r:{id}"))?;
+    let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+    loop {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "tab-history listener did not acknowledge the action; check plugin startup logs")
+        })?;
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let event = read_json(&mut reader).map_err(|error| {
+            if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                io::Error::new(io::ErrorKind::TimedOut, "tab-history listener did not acknowledge the action; check plugin startup logs")
+            } else { error }
+        })?;
+        if control(&event) == Some((workspace.as_str(), format!("d:{id}").as_str())) {
+            return Ok(());
+        }
+        if control(&event) == Some((workspace.as_str(), format!("e:{id}").as_str())) {
+            return Err(io::Error::other(
+                "tab-history listener could not focus the last tab; the target may have closed",
+            ));
+        }
+    }
 }
 
 fn run() -> io::Result<()> {

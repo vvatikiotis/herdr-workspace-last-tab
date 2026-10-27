@@ -29,17 +29,21 @@ The previous `herdr-workspace-last-tab-bin` executable and its old state directo
 
 ## Runtime and storage
 
-Herdr runs `listen` as the plugin startup command. It subscribes to tab-focus, tab-close, and workspace-close events and exits when that server connection closes. A session-local lock prevents duplicate listeners. Herdr does not supervise or automatically restart failed startup commands; inspect failures with:
+Herdr runs `listen` as the plugin startup command. It subscribes to tab-focus, workspace-metadata, tab-close, and workspace-close events and exits when that server connection closes. A session-local lock prevents duplicate listeners. Herdr does not supervise or automatically restart failed startup commands; inspect failures with:
 
 ```sh
 herdr plugin log list --plugin user.herdr-workspace-last-tab
 ```
 
-`switch` is a short-lived plugin action. Both commands require Herdr's injected `HERDR_SOCKET_PATH` and `HERDR_PLUGIN_STATE_DIR`.
+`switch` is a short-lived plugin action that requests a switch from the listener and waits for completion (up to five seconds). It does not independently advance history from a potentially ahead-of-stream snapshot. Both commands require Herdr's injected `HERDR_SOCKET_PATH` and `HERDR_PLUGIN_STATE_DIR`.
+
+A session-specific action lock serializes complete shortcut invocations, including their completion acknowledgment. It is separate from the listener's state lock, so the listener can continue processing events while an action waits.
+
+Requests use the private workspace token `workspace_last_tab_control` with a five-second TTL. This token carries request identifiers, not tab history. The listener replies with a second marker before executing the request. Herdr 0.9.5 drains the focus subscription before the metadata subscription; a reply generated while handling one metadata batch cannot occur in that already-captured batch. The next focus drain therefore processes preceding focus events before the reply. A completion marker acknowledges the saved switch. Only the listener writes history, and duplicate/expired markers are ignored. A failed focus request returns an error acknowledgment without stopping tracking; controls for closed workspaces are ignored. This ordering depends on Herdr's subscription-batch implementation: rerun the real-session test when upgrading Herdr.
 
 History lives under `HERDR_PLUGIN_STATE_DIR/sessions/<hex-encoded-socket-path>/state.json`. Socket identity separates sessions even when their workspace/tab IDs overlap and remains stable across server restarts. The listener prunes invalid references and reconciles restored active tabs on startup. Existing history is preserved; old standalone watcher history is not migrated.
 
-State updates use an OS file lock and atomic replacement through a sibling `state.json.new` file in the state directory, never `/tmp`. Invalid state JSON causes an explicit failure rather than silently resetting history.
+The listener is the sole history writer. State updates use an OS file lock and atomic replacement through a sibling `state.json.new` file in the state directory, never `/tmp`. Invalid state JSON causes an explicit failure rather than silently resetting history.
 
 Tab-focus payloads preserve intermediate tab changes even when a snapshot already shows a later active tab. Herdr guarantees ordering within the tab-focus subscription, not across different subscription types; authoritative snapshots remove closed tabs and workspaces. Pane changes that repeat the same active tab do not change history.
 
@@ -55,6 +59,6 @@ cargo build --release --locked
 python3 tests/live.py
 ```
 
-`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery and plugin-action dispatch, and stops only its own server. It does not simulate physical keyboard input or modify the active session's registry.
+`cargo test` runs the Python 3 mock-socket command tests. They exercise history through the plugin commands and focus requests, not by asserting on saved JSON. The real Herdr test uses private config/state directories and a disposable headless session, checks startup/event delivery and plugin-action dispatch, verifies restart persistence, and stops only its own server. It does not simulate physical keyboard input or modify the active session's registry.
 
 See [SPEC.md](SPEC.md) for agreed behavior and [GLOSSARY.md](GLOSSARY.md) for terminology.

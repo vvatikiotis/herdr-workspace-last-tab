@@ -20,6 +20,16 @@ class Herdr:
         self.focused = 'w'
         self.requests = []
         self.subscriber = None
+        self.control_subscribers = []
+        self.deferred = []
+        self.defer_focus = False
+        self.fail_focus = False
+        self.hold_done = False
+        self.pending_done = []
+        self.done_held = threading.Event()
+        self.second_request = threading.Event()
+        self.request_count = 0
+        self.send_lock = threading.Lock()
         self.snapshots = 0
         self.condition = threading.Condition()
         self.closed = False
@@ -45,19 +55,56 @@ class Herdr:
             request = json.loads(connection.makefile('rb').readline())
             method = request['method']
             if method == 'events.subscribe':
-                self.subscriber = connection
+                is_listener = any(s['type'] == 'tab.focused' for s in request['params']['subscriptions'])
+                if is_listener:
+                    self.subscriber = connection
+                else:
+                    self.control_subscribers.append(connection)
                 connection.sendall((json.dumps({'id': request['id'], 'result': {'type': 'subscription_started'}}) + '\n').encode())
-                while not self.closed and self.subscriber is connection:
-                    time.sleep(.01)
+                if is_listener:
+                    while not self.closed and self.subscriber is connection:
+                        time.sleep(.01)
+                else:
+                    connection.recv(1)
+                    self.control_subscribers.remove(connection)
                 return
             if method == 'session.snapshot':
                 result = {'snapshot': {'focused_workspace_id': self.focused,
                     'workspaces': [{'workspace_id': w, 'active_tab_id': t} for w, t in self.active.items()],
                     'tabs': [{'workspace_id': w, 'tab_id': t} for w, ts in self.tabs.items() for t in ts]}}
             elif method == 'tab.focus':
+                if self.fail_focus:
+                    connection.sendall((json.dumps({'id': request['id'], 'error': {
+                        'code': 'tab_not_found', 'message': 'tab closed during focus'}}) + '\n').encode())
+                    return
                 target = request['params']['tab_id']
                 self.requests.append(target)
-                self.active[self.focused] = target
+                workspace = next(w for w, tabs in self.tabs.items() if target in tabs)
+                self.active[workspace] = target
+                self.focused = workspace
+                focus_event = {'event': 'tab_focused', 'data': {'workspace_id': workspace, 'tab_id': target}}
+                if self.defer_focus:
+                    self.deferred.append(focus_event)
+                else:
+                    self.emit(focus_event)
+                result = {}
+            elif method == 'workspace.report_metadata':
+                if request['params']['workspace_id'] not in self.active:
+                    connection.sendall((json.dumps({'id': request['id'], 'error': {
+                        'code': 'workspace_not_found', 'message': 'workspace closed'}}) + '\n').encode())
+                    return
+                token = request['params']['tokens'].get('workspace_last_tab_control', '')
+                if token.startswith('r:'):
+                    self.request_count += 1
+                    if self.request_count == 2:
+                        self.second_request.set()
+                # Herdr drains focus batches before metadata batches. A marker
+                # generated in response cannot occur in that same metadata batch.
+                for event in self.deferred:
+                    self.emit(event)
+                self.deferred.clear()
+                self.emit({'event': 'workspace_metadata_updated', 'data': {'workspace': {
+                    'workspace_id': request['params']['workspace_id'], 'tokens': request['params']['tokens']}}})
                 result = {}
             else:
                 raise AssertionError(method)
@@ -72,9 +119,26 @@ class Herdr:
             if not self.condition.wait_for(lambda: self.snapshots > previous, timeout=3):
                 raise AssertionError('listener did not request a snapshot')
 
+    def emit(self, event):
+        recipients = [self.subscriber]
+        if event['event'] == 'workspace_metadata_updated':
+            recipients += list(self.control_subscribers)
+        with self.send_lock:
+            for connection in recipients:
+                if connection:
+                    token = event.get('data', {}).get('workspace', {}).get('tokens', {}).get('workspace_last_tab_control', '')
+                    if self.hold_done and connection is not self.subscriber and token.startswith('d:'):
+                        self.pending_done.append((connection, event))
+                        self.done_held.set()
+                        continue
+                    try:
+                        connection.sendall((json.dumps(event) + '\n').encode())
+                    except OSError:
+                        pass
+
     def event(self, event, **data):
         previous = self.snapshots
-        self.subscriber.sendall((json.dumps({'event': event.replace('.', '_'), 'data': data}) + '\n').encode())
+        self.emit({'event': event.replace('.', '_'), 'data': data})
         self.wait_snapshot(previous)
 
     def focus(self, workspace, tab):
@@ -169,6 +233,16 @@ class Protocol(unittest.TestCase):
         self.switch()
         self.assertEqual(self.server.requests, ['b'])
 
+    def test_restart_preserves_last_tab_when_active_tab_is_unchanged(self):
+        listener = self.listen()
+        self.server.focus('w', 'b')
+        self.server.subscriber.shutdown(socket.SHUT_RDWR)
+        self.assertEqual(listener.wait(timeout=3), 0)
+        self.server.subscriber = None
+        self.listen()
+        self.switch()
+        self.assertEqual(self.server.requests, ['a'])
+
     def test_closing_last_tab_does_not_fall_back(self):
         self.listen()
         self.server.focus('w', 'b')
@@ -210,6 +284,95 @@ class Protocol(unittest.TestCase):
         self.server.event('tab.focused', type='tab_focused', workspace_id='w', tab_id='c')
         self.switch()
         self.assertEqual(self.server.requests, ['b'])
+
+    def test_queued_request_for_closed_workspace_does_not_stop_other_history(self):
+        self.listen()
+        del self.server.active['w']
+        del self.server.tabs['w']
+        self.server.focused = 'other'
+        self.server.event('workspace.metadata_updated', workspace={
+            'workspace_id': 'w', 'tokens': {'workspace_last_tab_control': f'r:{time.time_ns()}:{os.getpid()}'}})
+        self.server.focus('other', 'y')
+        self.switch()
+        self.assertEqual(self.server.requests, ['x'])
+
+    def test_concurrent_action_waits_until_previous_completion_is_delivered(self):
+        self.listen()
+        self.server.focus('w', 'b')
+        self.server.hold_done = True
+        first = subprocess.Popen([BINARY, 'switch'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        second = None
+        try:
+            self.assertTrue(self.server.done_held.wait(2))
+            second = subprocess.Popen([BINARY, 'switch'], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertFalse(self.server.second_request.wait(.5), 'second action overtook unacknowledged first action')
+        finally:
+            with self.server.send_lock:
+                self.server.hold_done = False
+                for connection, event in self.server.pending_done:
+                    try:
+                        connection.sendall((json.dumps(event) + '\n').encode())
+                    except OSError:
+                        pass
+            for process in [first, second]:
+                if process:
+                    _, error = process.communicate(timeout=7)
+                    self.assertEqual(process.returncode, 0, error)
+        self.assertEqual(self.server.requests, ['a', 'b'])
+
+    def test_concurrent_actions_each_toggle_once(self):
+        self.listen()
+        self.server.focus('w', 'b')
+        processes = [subprocess.Popen([BINARY, 'switch'], env=self.env,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(16)]
+        try:
+            for process in processes:
+                _, error = process.communicate(timeout=7)
+                self.assertEqual(process.returncode, 0, error)
+            self.assertEqual(self.server.requests, ['a', 'b'] * 8)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_failed_focus_does_not_stop_listener(self):
+        self.listen()
+        self.server.focus('w', 'b')
+        self.server.fail_focus = True
+        result = subprocess.run([BINARY, 'switch'], env=self.env, capture_output=True, text=True, timeout=7)
+        self.assertNotEqual(result.returncode, 0)
+        self.server.fail_focus = False
+        self.switch()
+        self.assertEqual(self.server.requests, ['a'])
+
+    def test_action_waits_for_preceding_queued_focus_events(self):
+        self.listen()
+        self.server.active['w'] = 'c'
+        self.server.deferred = [
+            {'event': 'tab_focused', 'data': {'workspace_id': 'w', 'tab_id': tab}}
+            for tab in ['b', 'c']]
+        self.switch()
+        self.assertEqual(self.server.requests, ['b'])
+
+    def test_queued_focus_of_closed_current_tab_clears_older_history(self):
+        self.listen()
+        self.server.active['w'] = 'b'
+        self.server.tabs['w'].remove('c')
+        for tab in ['b', 'c', 'b']:
+            self.server.event('tab.focused', type='tab_focused', workspace_id='w', tab_id=tab)
+        self.switch()
+        self.assertEqual(self.server.requests, [])
+
+    def test_delayed_action_focus_event_does_not_break_next_toggle(self):
+        self.listen()
+        self.server.focus('w', 'b')
+        self.server.defer_focus = True
+        self.switch()
+        self.switch()
+        self.assertEqual(self.server.requests, ['a', 'b'])
+        self.switch()
+        self.assertEqual(self.server.requests, ['a', 'b', 'a'])
 
     def test_duplicate_focus_events_leave_last_tab_unchanged(self):
         self.listen()

@@ -73,23 +73,33 @@ command = "user.herdr-workspace-last-tab.switch"
                     return next(w['active_tab_id'] for w in snapshot['workspaces'] if w['workspace_id'] == workspace_id)
                 def switch():
                     request('plugin.action.invoke', action_id=PLUGIN + '.switch')
-                # Allow async server delivery, then assert through the action.
-                time.sleep(.3)
+                # No delivery sleeps: the action/listener barrier must catch up.
                 switch()
                 eventually(lambda: active() == b, 'C did not switch to B')
-                time.sleep(.15)
                 switch()
                 eventually(lambda: active() == c, 'B did not toggle back to C')
                 # Several focus events can be drained in one subscription batch.
                 request('tab.focus', tab_id=a)
                 request('tab.focus', tab_id=b)
                 request('tab.focus', tab_id=c)
-                time.sleep(.3)
                 switch()
                 eventually(lambda: active() == b, 'rapid A -> B -> C lost B')
+                for expected in [c, b] * 5:
+                    switch()
+                    eventually(lambda: active() == expected, 'repeated toggle lost event ordering')
+                state_file = next((root / 'state').glob('herdr/plugins/*/sessions/*/state.json'))
+                before_restart = state_file.stat().st_mtime_ns
+                request('server.stop')
+                server.wait(timeout=10)
+                server = subprocess.Popen(['herdr', '--session', 'last-tab-test', 'server'],
+                                          env=env, stdout=log, stderr=log)
+                eventually(lambda: state_file.stat().st_mtime_ns != before_restart,
+                           'restart listener did not reconcile persisted history')
+                switch()
+                eventually(lambda: active() == c, 'history did not survive server restart')
                 registered = request('plugin.action.list', plugin_id=PLUGIN)
                 assert PLUGIN in json.dumps(registered), registered
-                print('PASS: real startup hook, rapid focus events, action dispatch, and toggle')
+                print('PASS: real startup hook, rapid focus events, action dispatch, toggle, and restart')
             except Exception:
                 print('plugin logs:', json.dumps(request('plugin.log.list', plugin_id=PLUGIN, limit=20), indent=2))
                 log.flush()
