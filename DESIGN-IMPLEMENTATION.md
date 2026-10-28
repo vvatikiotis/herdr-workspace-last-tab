@@ -2,6 +2,8 @@
 
 This document explains how the plugin implements [SPEC.md](SPEC.md). Requirement links point directly to stable IDs in the spec; known gaps are identified separately. For installation and operation, see [README.md](README.md).
 
+Terminology follows [GLOSSARY.md](GLOSSARY.md): [current tab](GLOSSARY.md#current-tab), [last tab](GLOSSARY.md#last-tab), and [workspace tab history](GLOSSARY.md#workspace-tab-history). Definitions are maintained only there.
+
 ## Processes and lifecycle
 
 Implements: [R1](SPEC.md#r1), [S1](SPEC.md#s1).
@@ -17,39 +19,40 @@ The listener subscribes to:
 - `tab.closed`
 - `workspace.closed`
 
-There is one listener per session, guarded by `listener.lock`. It exits normally on subscription EOF. Other socket/protocol errors, including `events_lost`, fail explicitly. Subscription history is not durable and does not replay events from before connection. Startup reconciliation restores current state, not unknowable changes made while tracking was absent.
+There is one listener per session, guarded by `listener.lock`. It exits normally on subscription EOF. Other socket/protocol errors, including `events_lost`, fail explicitly. Herdr's retained event stream is not durable and does not replay events from before connection. Startup reconciliation restores current state, not unknowable changes made while tracking was absent.
 
-Individual plugin event hooks are deliberately not used to write history. Herdr launches them concurrently without guaranteeing execution or completion order. A single subscription reader processes focus events sequentially without polling.
+Individual plugin event hooks are deliberately not used to write workspace tab history. Herdr launches them concurrently without guaranteeing execution or completion order. A single subscription reader processes focus events sequentially without polling.
 
 Both commands require `HERDR_SOCKET_PATH` from their Herdr invocation environment. The raw socket implementation supports macOS and Linux.
 
-## History model
+<a id="history-model"></a>
+## Workspace tab history model
 
 Implements: [H1](SPEC.md#h1), [H3](SPEC.md#h3), [H4](SPEC.md#h4), [H5](SPEC.md#h5), [H6](SPEC.md#h6).
 
-`State` maps workspace IDs to `WorkspaceHistory`. Each history contains a `tab_ids` list, most recently used first, capped at six entries including the current tab.
+`State` maps workspace IDs to `WorkspaceHistory`. Each `WorkspaceHistory` stores workspace tab history in a `tab_ids` list, most recently used first, capped at six entries including the current tab.
 
-On focus, the listener removes an existing occurrence of the tab, inserts it at the front, and truncates the list. Repeated observations of the same active tab preserve its order and do not consume another slot. Evicted entries are not kept elsewhere.
+On focus, the listener updates workspace tab history by removing an existing occurrence of the tab, inserting it at the front, and truncating the list. Repeated observations of the same current tab preserve its order and do not consume another slot. Evicted entries are not kept elsewhere.
 
-Focus payloads preserve intermediate visits even when the latest snapshot already shows a later active tab. Snapshot pruning runs at startup and at the prepared-action boundary described below, after preceding focus events have drained. Pruning on every snapshot would erase entries for subsequently closed tabs before queued visits had counted toward capacity, potentially retaining an entry that should have been evicted.
+Focus payloads preserve intermediate visits even when the snapshot's current tab has already changed again. Snapshot pruning runs at startup and at the prepared-action boundary described below, after preceding focus events have drained. Pruning on every snapshot would erase entries for subsequently closed tabs before queued visits had counted toward capacity, potentially retaining an entry that should have been evicted.
 
 ### Switching
 
 Implements: [S2](SPEC.md#s2), [S3](SPEC.md#s3), [S4](SPEC.md#s4), [S5](SPEC.md#s5).
 
-The switch target is the most recent valid retained tab other than the live active tab in that workspace. With no such target, the command does nothing. A successful focus updates history synchronously, so subsequent requests can toggle back. The command exposes no picker or history traversal mode.
+The switch target is the workspace's last tab. With no last tab, the command does nothing. A successful focus updates workspace tab history synchronously, so subsequent requests can toggle back. The command exposes no picker or mode for traversing workspace tab history.
 
 ### Closure
 
 Implements: [C1](SPEC.md#c1), [C2](SPEC.md#c2), [C3](SPEC.md#c3), [C4](SPEC.md#c4), [C5](SPEC.md#c5).
 
-Closure events remove the tab or workspace entry directly, preserving the remaining entries' order. The plugin does not choose a replacement after a closure; Herdr's resulting focus change updates recency. Removing a newer entry makes an older retained tab eligible for switching.
+Closure events remove a tab from workspace tab history or delete the closed workspace's entire workspace tab history, preserving other entries' order. The plugin does not choose a replacement after a closure; Herdr's resulting change of current tab updates workspace tab history. Removing a newer entry can make an older entry the last tab.
 
 ### Startup reconciliation
 
 Implements: [H3](SPEC.md#h3), [R2](SPEC.md#r2), [R3](SPEC.md#r3).
 
-Reconciliation removes invalid workspace/tab references, removes duplicate entries, enforces the limit, and moves each restored workspace's active tab to the front. With no saved history, recording the active tab creates only that entry. Switching panes without changing the active tab does not change recency.
+Reconciliation removes invalid references and duplicate entries from workspace tab history, enforces the limit, and moves each restored current tab to the front. With no saved workspace tab history, recording the current tab creates only that entry. Switching panes without changing the current tab does not change workspace tab history.
 
 ## State directory and session isolation
 
@@ -70,13 +73,13 @@ The plugin state directory is shared by Herdr sessions. Session-specific files l
   state.json
 ```
 
-Socket identity prevents collisions between sessions whose workspace/tab IDs overlap. It remains stable across server restarts, unlike a process ID. Shell commands and startup hooks must resolve the same history and lock namespace.
+Socket identity prevents collisions between sessions whose workspace/tab IDs overlap. It remains stable across server restarts, unlike a process ID. Shell commands and startup hooks must use the same workspace tab history and session locks.
 
 ## Persistence and migration
 
 Implements: [R2](SPEC.md#r2), [U1](SPEC.md#u1), [U2](SPEC.md#u2).
 
-The listener is the sole history writer. It saves JSON in this form:
+The listener is the sole writer of workspace tab history. It saves JSON in this form:
 
 ```json
 {
@@ -96,27 +99,27 @@ The loader also accepts the previous plugin format:
 }
 ```
 
-Version 0.3.0 preserves the valid current/last pair in recency order and writes the migrated list back to the same file during startup. Additional open tabs are not used to fabricate older history. If a list is present, it takes precedence over legacy fields.
+Version 0.3.0 preserves the valid `current_tab_id`/`last_tab_id` pair in recency order and writes the migrated workspace tab history back to the same file during startup. Additional open tabs are not used to fabricate entries in workspace tab history. If a list is present, it takes precedence over legacy fields.
 
 The earlier standalone polling watcher's state directory and `herdr-workspace-last-tab-bin` executable are not used or migrated. Old files are not deleted automatically.
 
-Writes hold `state.lock`, serialize to a sibling `state.json.new`, sync the file, rename it over `state.json`, and sync the directory. The staging file stays in the state directory, not a system temporary directory. A missing state file initializes empty history; invalid JSON fails explicitly rather than silently resetting it.
+Writes hold `state.lock`, serialize to a sibling `state.json.new`, sync the file, rename it over `state.json`, and sync the directory. The staging file stays in the state directory, not a system temporary directory. A missing state file initializes empty workspace tab history; invalid JSON fails explicitly rather than silently resetting it.
 
 ## Shortcut synchronization
 
 Implements: [H4](SPEC.md#h4), [S2](SPEC.md#s2), [S3](SPEC.md#s3), [S4](SPEC.md#s4).
 
-A latest-active snapshot cannot reveal intermediate tab visits still waiting in the subscription stream. Therefore `switch` does not independently advance history. It requests work from the listener and waits for completion.
+A snapshot of the current tab cannot reveal intermediate tab visits still waiting in the subscription stream. Therefore `switch` does not independently update workspace tab history. It requests work from the listener and waits for completion.
 
-A session-specific `action.lock` is held from before the command's initial snapshot through completion/error acknowledgment. This serializes entire shortcut invocations, not merely writes. It is separate from `state.lock`, allowing the listener to continue while a command waits. Without this serialization, delayed focus events from one action could roll history backward before a concurrent prepared request executes.
+A session-specific `action.lock` is held from before the command's initial snapshot through completion/error acknowledgment. This serializes entire shortcut invocations, not merely writes. It is separate from `state.lock`, allowing the listener to continue while a command waits. Without this serialization, delayed focus events from one action could roll workspace tab history backward before a concurrent prepared request executes.
 
-Requests use the private workspace token `workspace_last_tab_control`, with a five-second TTL. Tokens contain request identifiers, not saved history.
+Requests use the private workspace token `workspace_last_tab_control`, with a five-second TTL. Tokens contain request identifiers, not workspace tab history.
 
 The exchange is:
 
 1. `switch` subscribes to workspace metadata updates and reports an `r:` request token.
 2. The listener receives it and reports a `p:` prepared token.
-3. When that prepared token arrives, the listener prunes invalid references, chooses the target, performs the focus, updates history, and saves it.
+3. When that prepared token arrives, the listener prunes invalid references, selects the last tab, focuses it if present, and saves the updated workspace tab history.
 4. The listener reports a `d:` completion token, or an `e:` token for a failed focus request. The waiting command returns success or error accordingly.
 
 Duplicate and expired control tokens are ignored. The command waits up to five seconds for completion after reporting its request. A failed focus request does not terminate tracking; preparation/completion reporting failures are logged rather than propagated out of the listener. Controls for workspaces absent from the live snapshot are ignored.
@@ -154,7 +157,7 @@ cargo build --release --locked
 python3 tests/live.py
 ```
 
-`cargo test` runs `tests/protocol.rs`, which invokes the Python 3 mock-socket tests in `tests/protocol.py`. These tests exercise public commands and focus requests, not private Rust functions or saved-JSON assertions. Legacy JSON is supplied as migration input. Coverage includes isolation, toggling, closure fallback, bounded distinct history, eviction, migration, restart persistence, queued focus events, concurrent actions, and request-specific error recovery.
+`cargo test` runs `tests/protocol.rs`, which invokes the Python 3 mock-socket tests in `tests/protocol.py`. These tests exercise public commands and focus requests, not private Rust functions or saved-JSON assertions. Legacy JSON is supplied as migration input. Coverage includes isolation, toggling, closure fallback, bounded distinct workspace tab history, eviction, migration, restart persistence, queued focus events, concurrent actions, and request-specific error recovery.
 
 `tests/live.py` uses private config/state directories and a disposable headless Herdr server. It checks startup/event delivery, direct shell invocation, optional plugin-action dispatch, rapid focus changes, restart persistence, six-tab retention, closure fallback, and eviction. It does not simulate physical keyboard input, promise exact cross-type chronology, or modify the active session's plugin registry. It stops only its own server.
 
